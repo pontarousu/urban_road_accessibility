@@ -1,3 +1,4 @@
+# [未使用] このファイルは Step 2（宛先分岐によるパケット分裂）の検証用です。現行のシミュレーションは simulate_equilibrium.py を参照してください。
 import osmnx as ox
 import networkx as nx
 import matplotlib.pyplot as plt

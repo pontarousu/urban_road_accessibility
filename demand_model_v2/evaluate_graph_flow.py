@@ -1,3 +1,4 @@
+# [未使用] このファイルは Step 1（単一パケットの最短経路探索）の検証用です。現行のシミュレーションは simulate_equilibrium.py を参照してください。
 """
 Demand Model v2 (Mesoscopic Model) - Step 1: グラフ上の単一パケット・ナビゲーション
 ラスタ（ピクセル）からグラフ（ネットワーク）への転換実験

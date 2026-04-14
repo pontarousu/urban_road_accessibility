@@ -17,3 +17,7 @@ cache/
 ._*
 .Spotlight-V100
 .Trashes
+
+# Media files (large)
+*.mp4
+*.png

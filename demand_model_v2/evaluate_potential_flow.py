@@ -1,3 +1,4 @@
+# [未使用] このファイルはラスタ法（ポテンシャル場）時代の実験です。グラフベースモデルへ転換済み。現行は simulate_equilibrium.py を参照。
 """
 Phase 3 (Experiment): evaluate_potential_flow.py
 大域的ポテンシャル場における単一パケットの流体力学的な経路探索シミュレーション
