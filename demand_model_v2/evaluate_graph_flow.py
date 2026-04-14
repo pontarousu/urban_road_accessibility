@@ -57,7 +57,7 @@ def main():
     try:
         route = nx.shortest_path(G_proj, source=orig_node, target=dest_node, weight='length')
         # 通過するエッジの長さを合計して総距離を計算
-        route_length = sum([G_proj.edges[u, v, 0].get('length', 0) for u, v in zip(route[:-1], route[1:])])
+        route_length = sum(G_proj.edges[u, v, 0].get('length', 0) for u, v in zip(route[:-1], route[1:]))
         print(f"   => 探索成功！ パケットは {len(route)} 個の交差点（ノード）を通過します。")
         print(f"   => 総移動距離: {route_length:.1f} m")
     except nx.NetworkXNoPath:
