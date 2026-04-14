@@ -1,5 +1,4 @@
 import osmnx as ox
-import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio.transform
