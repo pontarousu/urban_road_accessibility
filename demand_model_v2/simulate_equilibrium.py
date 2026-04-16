@@ -1,18 +1,13 @@
 """
-Demand Model v2 - Step 3.5: 逐次シミュレーション・エンジン (v3: 段階的投入版)
+Demand Model v2 - Step 3.5: 逐次シミュレーション・エンジン (v4: 境界流入版)
 ============================================================
 交差点ごとに「次のエッジの貯留容量 vs 自分の人数」を判定し、
 容量を超過する場合はドライバーの集団意思決定として
 パケットが自発的に分裂（迂回）するシミュレーション。
 
-[v3での追加修正]
-- 段階的投入（Gradual Injection）: 1500台を一度に生成するのではなく、
-  injection_rateステップあたりの台数で段階的にSTARTノードへ投入する
-  → 先行バッチが道を空けてから後続が来るため、物理的に自然な交通流が実現
-
-[v2での修正点（継続）]
-1. Volume退出処理: パケットがエッジを離れたら volume を減算する
-2. 次元の整合: 分裂判定に「貯留容量 C_storage（台）」を使用
+[v4] 境界流入（Boundary Injection）: マップの外周ノードから流入
+[v3] 段階的投入（Gradual Injection）
+[v2] Volume退出処理 + 貯留容量（次元統一）
 """
 
 import osmnx as ox
@@ -20,8 +15,10 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.patheffects as pe
+import matplotlib.colors as mcolors
 import numpy as np
 import imageio_ffmpeg
+from matplotlib.collections import LineCollection
 from shapely.geometry import LineString
 from assign_capacity import (
     calculate_capacity,
@@ -38,7 +35,7 @@ plt.rcParams['animation.ffmpeg_path'] = imageio_ffmpeg.get_ffmpeg_exe()
 CENTER = (36.5613, 136.6562)
 DIST = 1000
 
-# パケットの配色パレット（投入バッチごとに色を循環）
+# パケットの配色パレット
 COLORS = [
     'darkviolet',    # 0: 初期
     'crimson',       # 1: 分裂子 - 直進組
@@ -54,8 +51,11 @@ COLORS = [
 # ============================================================
 # 1. グラフ初期化
 # ============================================================
-def setup_graph():
-    """道路ネットワークの読み込みとCapacity/BPRの初期化"""
+def setup_graph(n_entry_points=6):
+    """
+    道路ネットワークの読み込みとCapacity/BPRの初期化。
+    マップの外周（境界）ノードを検出し、流入地点として返す。
+    """
     print("1. グラフロードとCapacityセットアップ...")
     G = ox.graph_from_point(CENTER, dist=DIST, network_type='drive')
     G_proj = ox.project_graph(G)
@@ -76,22 +76,49 @@ def setup_graph():
 
     apply_dynamic_weights(G_proj, capacity_key='storage_capacity')
 
-    # スタート・ゴールをネットワークの対角線上に配置
+    # === 境界ノードの検出 ===
     nodes_gdf = ox.graph_to_gdfs(G_proj, edges=False)
     minx, miny, maxx, maxy = nodes_gdf.total_bounds
-    start_node = ox.distance.nearest_nodes(
-        G_proj, minx + (maxx - minx) * 0.2, miny + (maxy - miny) * 0.2)
-    end_node = ox.distance.nearest_nodes(
-        G_proj, maxx - (maxx - minx) * 0.2, maxy - (maxy - miny) * 0.2)
+    cx = (minx + maxx) / 2
+    cy = (miny + maxy) / 2
 
-    # 貯留容量の統計情報を表示
+    node_dists = []
+    for node_id, row in nodes_gdf.iterrows():
+        dx = row.geometry.x - cx
+        dy = row.geometry.y - cy
+        dist = np.sqrt(dx**2 + dy**2)
+        angle = np.arctan2(dy, dx)
+        node_dists.append((node_id, dist, angle))
+
+    # 角度でセクター分割し、各セクター内で最も遠いノードを選択
+    sector_size = 2 * np.pi / n_entry_points
+    entry_nodes = []
+    for i in range(n_entry_points):
+        sector_min = -np.pi + i * sector_size
+        sector_max = sector_min + sector_size
+        candidates = [(nid, d, a) for nid, d, a in node_dists
+                       if sector_min <= a < sector_max]
+        if candidates:
+            best = max(candidates, key=lambda x: x[1])
+            entry_nodes.append(best[0])
+
+    dest_node = ox.distance.nearest_nodes(G_proj, cx, cy)
+
+    # 到達可能でないエントリーポイントを除外
+    reachable = [en for en in entry_nodes
+                 if nx.has_path(G_proj, en, dest_node)]
+    entry_nodes = reachable
+
+    print(f"   流入地点: {len(entry_nodes)}箇所（マップ外周）")
+    print(f"   目的地: Node {dest_node}（都市中心部）")
+
     storage_caps = [d['storage_capacity']
                     for _, _, _, d in G_proj.edges(keys=True, data=True)]
     print(f"   貯留容量の統計: min={min(storage_caps)}, "
           f"median={sorted(storage_caps)[len(storage_caps)//2]}, "
-          f"max={max(storage_caps)}, edges={len(storage_caps)}")
+          f"max={max(storage_caps)}")
 
-    return G_proj, start_node, end_node
+    return G_proj, entry_nodes, dest_node
 
 
 # ============================================================
@@ -104,10 +131,7 @@ def reset_volumes(G):
 
 
 def recompute_volumes_from_packets(G, packets):
-    """
-    全パケットの occupied_edge から、エッジ上の交通量を再計算する。
-    各ステップの冒頭で呼ぶことで、volumeの累積ドリフトを完全に防止する。
-    """
+    """全パケットのoccupied_edgeからvolumeを再計算する"""
     reset_volumes(G)
     for p in packets:
         edge = p.get('occupied_edge')
@@ -119,34 +143,42 @@ def recompute_volumes_from_packets(G, packets):
                 pass
 
 
+def snapshot_edge_volumes(G):
+    """現在の全エッジのvolume/storage_capacityをスナップショットとして返す"""
+    volumes = {}
+    for u, v, k, data in G.edges(keys=True, data=True):
+        vol = data.get('volume', 0.0)
+        cap = data.get('storage_capacity', 1)
+        if vol > 0:
+            volumes[(u, v)] = vol / max(cap, 1)
+    return volumes
+
+
 # ============================================================
 # 3. 逐次シミュレーション・エンジン
 # ============================================================
-def run_simulation(G, start_node, end_node,
+def run_simulation(G, entry_nodes, dest_node,
                    total_users=1500, injection_rate=100):
     """
-    交差点ごとに判定する逐次シミュレーション・エンジン（v3: 段階的投入版）。
+    交差点ごとに判定する逐次シミュレーション・エンジン（v4: 境界流入版）。
 
-    Parameters:
-        total_users: 投入する総ユーザー数
-        injection_rate: 1ステップあたりの投入台数（段階的投入）
-
-    [v3での変更点]
-    - 初期パケットを1つ作るのではなく、ステップごとに injection_rate 人ずつ
-      STARTノードへ新規パケットとして投入する（段階的投入）
-    - 先行バッチが道を空けてから後続が到着するため、
-      貯留容量の小さい住宅地道路でも自然に流れる
+    Returns:
+        history: ステップごとのパケットスナップショット
+        volume_history: ステップごとのエッジ混雑率スナップショット
+        split_counts: ステップごとの分裂（迂回選択）回数
     """
-    injection_steps = (total_users + injection_rate - 1) // injection_rate
+    n_entries = len(entry_nodes)
+    per_entry_rate = max(injection_rate // n_entries, 1)
+    actual_rate = per_entry_rate * n_entries
+
     print(f"2. 逐次シミュレーション開始")
     print(f"   総ユーザー: {total_users}人")
-    print(f"   投入レート: {injection_rate}人/ステップ × {injection_steps}ステップ")
+    print(f"   流入地点: {n_entries}箇所")
+    print(f"   投入レート: {per_entry_rate}人/地点/step × {n_entries}地点 = {actual_rate}人/step")
 
-    # 全エッジのvolumeをリセット
     reset_volumes(G)
     apply_dynamic_weights(G, capacity_key='storage_capacity')
 
-    # パケットID管理
     pid_counter = [0]
     def next_pid():
         pid = pid_counter[0]
@@ -155,56 +187,66 @@ def run_simulation(G, start_node, end_node,
 
     packets = []
     history = []
+    volume_history = []  # エッジ混雑率のスナップショット
+    split_counts = []    # ステップごとの分裂回数
     injected_total = 0
     MAX_STEPS = 500
 
     for step in range(MAX_STEPS):
-        # === v3: 段階的投入 ===
+        # === 境界ノード群から同時投入 ===
         if injected_total < total_users:
-            batch_size = min(injection_rate, total_users - injected_total)
-            # 現在の渋滞状況を反映した最短ルートを計算
-            route = nx.shortest_path(
-                G, start_node, end_node, weight='bpr_weight')
-            new_packet = {
-                'id': next_pid(),
-                'node': start_node,
-                'prev_node': start_node,
-                'dest': end_node,
-                'size': batch_size,
-                'route': list(route),
-                'arrived': False,
-                'color_idx': 0,  # 投入時は darkviolet
-                'occupied_edge': None,
-            }
-            packets.append(new_packet)
-            injected_total += batch_size
-            print(f"  Step {step}: {batch_size}人を投入 "
-                  f"(累計: {injected_total}/{total_users})")
+            step_injected = 0
+            for entry_node in entry_nodes:
+                remaining = total_users - injected_total - step_injected
+                if remaining <= 0:
+                    break
+                batch_size = min(per_entry_rate, remaining)
+                try:
+                    route = nx.shortest_path(
+                        G, entry_node, dest_node, weight='bpr_weight')
+                except nx.NetworkXNoPath:
+                    continue
+                packets.append({
+                    'id': next_pid(),
+                    'node': entry_node,
+                    'prev_node': entry_node,
+                    'dest': dest_node,
+                    'size': batch_size,
+                    'route': list(route),
+                    'arrived': False,
+                    'color_idx': 0,
+                    'occupied_edge': None,
+                })
+                step_injected += batch_size
+            injected_total += step_injected
+            if step_injected > 0:
+                print(f"  Step {step}: {step_injected}人を投入 "
+                      f"({n_entries}地点) [累計: {injected_total}/{total_users}]")
 
-        # === 毎ステップ冒頭でVolumeを再計算 ===
+        # === Volume再計算 ===
         recompute_volumes_from_packets(G, packets)
         apply_dynamic_weights(G, capacity_key='storage_capacity')
 
-        # === スナップショット記録 ===
+        # === スナップショット ===
         snapshot = []
         for p in packets:
             snapshot.append({
-                'id': p['id'],
-                'node': p['node'],
-                'prev_node': p['prev_node'],
-                'size': p['size'],
-                'arrived': p['arrived'],
-                'color_idx': p['color_idx'],
+                'id': p['id'], 'node': p['node'],
+                'prev_node': p['prev_node'], 'size': p['size'],
+                'arrived': p['arrived'], 'color_idx': p['color_idx'],
             })
         history.append(snapshot)
+        volume_history.append(snapshot_edge_volumes(G))
 
-        # 全パケット到着チェック（投入完了後のみ判定）
+        # 全パケット到着チェック
         if injected_total >= total_users and all(p['arrived'] for p in packets):
             print(f"  => 全パケットがゴールに到達（{step}ステップ）")
             break
 
         # === 各パケットの処理 ===
         next_packets = []
+        step_splits = 0
+
         for p in packets:
             if p['arrived']:
                 p['prev_node'] = p['node']
@@ -231,9 +273,7 @@ def run_simulation(G, start_node, end_node,
                 next_packets.append(p)
                 continue
 
-            # ■ 貯留容量判定 ■
             if p['size'] <= cap:
-                # 全員通過可能 → 1ホップ前進
                 p['prev_node'] = u
                 p['node'] = v
                 p['route'] = p['route'][1:]
@@ -246,28 +286,23 @@ def run_simulation(G, start_node, end_node,
                 # ■ 分裂発生 ■
                 size_a = int(cap)
                 size_b = p['size'] - size_a
+                step_splits += 1
 
-                if step < 30 or step % 20 == 0:  # ログ量を制限
-                    print(f"  Step {step}: Node {u} で分裂！ "
-                          f"{p['size']}人 → {size_a}人(直進) + {size_b}人(迂回)"
-                          f" [貯留容量={cap}]")
+                if step < 30 or step % 20 == 0:
+                    print(f"  Step {step}: Node {u} 分裂 "
+                          f"{p['size']}→{size_a}+{size_b} [cap={cap}]")
 
                 # グループA: 直進
-                route_a = p['route'][1:]
                 pa = {
-                    'id': next_pid(),
-                    'node': v,
-                    'prev_node': u,
-                    'dest': p['dest'],
-                    'size': size_a,
-                    'route': route_a,
+                    'id': next_pid(), 'node': v, 'prev_node': u,
+                    'dest': p['dest'], 'size': size_a,
+                    'route': p['route'][1:],
                     'arrived': (v == p['dest']),
                     'color_idx': 1,
                     'occupied_edge': (u, v) if v != p['dest'] else None,
                 }
                 next_packets.append(pa)
 
-                # Aの進入を反映してBの迂回路を探索
                 edge_data['volume'] += size_a
                 apply_dynamic_weights(G, capacity_key='storage_capacity')
 
@@ -279,36 +314,33 @@ def run_simulation(G, start_node, end_node,
 
                 # グループB: 迂回
                 pb = {
-                    'id': next_pid(),
-                    'node': u,
-                    'prev_node': u,
-                    'dest': p['dest'],
-                    'size': size_b,
-                    'route': new_route,
-                    'arrived': False,
+                    'id': next_pid(), 'node': u, 'prev_node': u,
+                    'dest': p['dest'], 'size': size_b,
+                    'route': new_route, 'arrived': False,
                     'color_idx': 2,
                     'occupied_edge': None,
                 }
                 next_packets.append(pb)
 
         packets = next_packets
+        split_counts.append(step_splits)
 
     # === 結果サマリ ===
     final = history[-1]
-    arrived_packets = [p for p in final if p['arrived']]
-    moving_packets = [p for p in final if not p['arrived']]
-    total_arrived = sum(p['size'] for p in arrived_packets)
+    arrived = [p for p in final if p['arrived']]
     sizes = [p['size'] for p in final]
+    total_arrived = sum(p['size'] for p in arrived)
+    total_splits = sum(split_counts)
 
     print(f"\n=== シミュレーション結果 ===")
     print(f"総ステップ数: {len(history)}")
-    print(f"最終パケット数: {len(final)} "
-          f"(到着: {len(arrived_packets)}, 移動中: {len(moving_packets)})")
+    print(f"最終パケット数: {len(final)} (到着: {len(arrived)})")
     print(f"到着済み人数: {total_arrived}/{total_users}")
     print(f"パケットサイズ: min={min(sizes)}, max={max(sizes)}, "
           f"median={sorted(sizes)[len(sizes)//2]}")
+    print(f"総分裂回数: {total_splits}")
 
-    return history
+    return history, volume_history, split_counts
 
 
 # ============================================================
@@ -331,15 +363,34 @@ def interpolate_on_edge(G, u, v, fraction):
         x1, y1 = get_node_xy(G, u)
         x2, y2 = get_node_xy(G, v)
         return (x1 + (x2 - x1) * fraction, y1 + (y2 - y1) * fraction)
-
     point = line.interpolate(fraction * line.length)
     return (point.x, point.y)
 
 
-def build_animation_frames(G, history):
+def build_edge_collection(G):
+    """
+    グラフの全エッジの座標を取得し、LineCollectionの描画データを構築する。
+    Returns: (segments, edge_keys) — segmentsはLineCollection用の座標リスト
+    """
+    segments = []
+    edge_keys = []
+    for u, v, k, data in G.edges(keys=True, data=True):
+        if 'geometry' in data:
+            coords = list(data['geometry'].coords)
+        else:
+            x1, y1 = get_node_xy(G, u)
+            x2, y2 = get_node_xy(G, v)
+            coords = [(x1, y1), (x2, y2)]
+        segments.append(coords)
+        edge_keys.append((u, v))
+    return segments, edge_keys
+
+
+def build_animation_frames(G, history, volume_history):
     """シミュレーション履歴をアニメーション用フレーム配列に変換する"""
-    FRAMES_PER_STEP = 12  # 1ホップあたり12フレーム（30fps → 0.4秒/ホップ）
-    frames = []
+    FRAMES_PER_STEP = 12
+    frames = []  # パケットフレーム
+    volume_frames = []  # 各フレームに対応するエッジ混雑率
 
     # 冒頭: 初期状態を0.5秒間表示
     for _ in range(15):
@@ -347,24 +398,25 @@ def build_animation_frames(G, history):
         for p in history[0]:
             x, y = get_node_xy(G, p['node'])
             frame_data.append({
-                'x': x, 'y': y,
-                'size': p['size'],
+                'x': x, 'y': y, 'size': p['size'],
                 'color': COLORS[p['color_idx'] % len(COLORS)],
                 'label': str(p['size']),
             })
         frames.append(frame_data)
+        volume_frames.append(volume_history[0] if volume_history else {})
 
     # ステップ間の補間
     for step_idx in range(len(history) - 1):
         current = {p['id']: p for p in history[step_idx]}
         nxt = {p['id']: p for p in history[step_idx + 1]}
-
         cur_ids = set(current.keys())
         nxt_ids = set(nxt.keys())
-
         continuing = cur_ids & nxt_ids
         born = nxt_ids - cur_ids
         died = cur_ids - nxt_ids
+
+        # このステップ間のエッジ混雑率（補間なし、ステップ単位）
+        vol_snap = volume_history[min(step_idx + 1, len(volume_history) - 1)]
 
         for f in range(FRAMES_PER_STEP):
             frac = f / max(FRAMES_PER_STEP - 1, 1)
@@ -378,8 +430,7 @@ def build_animation_frames(G, history):
                 else:
                     pos = get_node_xy(G, c['node'])
                 frame_data.append({
-                    'x': pos[0], 'y': pos[1],
-                    'size': c['size'],
+                    'x': pos[0], 'y': pos[1], 'size': c['size'],
                     'color': COLORS[c['color_idx'] % len(COLORS)],
                     'label': str(c['size']),
                 })
@@ -389,8 +440,7 @@ def build_animation_frames(G, history):
                     c = current[pid]
                     pos = get_node_xy(G, c['node'])
                     frame_data.append({
-                        'x': pos[0], 'y': pos[1],
-                        'size': c['size'],
+                        'x': pos[0], 'y': pos[1], 'size': c['size'],
                         'color': COLORS[c['color_idx'] % len(COLORS)],
                         'label': str(c['size']),
                     })
@@ -404,13 +454,13 @@ def build_animation_frames(G, history):
                     else:
                         pos = get_node_xy(G, n['node'])
                     frame_data.append({
-                        'x': pos[0], 'y': pos[1],
-                        'size': n['size'],
+                        'x': pos[0], 'y': pos[1], 'size': n['size'],
                         'color': COLORS[n['color_idx'] % len(COLORS)],
                         'label': str(n['size']),
                     })
 
             frames.append(frame_data)
+            volume_frames.append(vol_snap)
 
     # 末尾: 最終状態を1秒間表示
     for _ in range(30):
@@ -418,84 +468,101 @@ def build_animation_frames(G, history):
         for p in history[-1]:
             x, y = get_node_xy(G, p['node'])
             frame_data.append({
-                'x': x, 'y': y,
-                'size': p['size'],
+                'x': x, 'y': y, 'size': p['size'],
                 'color': COLORS[p['color_idx'] % len(COLORS)],
                 'label': str(p['size']),
             })
         frames.append(frame_data)
+        volume_frames.append(volume_history[-1] if volume_history else {})
 
-    return frames
+    return frames, volume_frames
 
 
 # ============================================================
 # 5. MP4レンダリング
 # ============================================================
 def dot_size(n_people):
-    """パケットの人数からドットの描画サイズ（ポイント²）を計算する"""
-    # 1人 = 30pt², 100人 = 300pt² にスケーリング（視認性確保）
+    """パケットの人数からドットの描画サイズを計算する"""
     return max(n_people * 3, 30)
 
 
-def render_mp4(G, frames, start_node, end_node, output_path,
+def render_mp4(G, frames, volume_frames, entry_nodes, dest_node, output_path,
                total_users=1500, injection_rate=100):
-    """フレームデータからMP4アニメーションを生成する"""
+    """フレームデータからMP4アニメーション（渋滞ヒートマップ付き）を生成する"""
     print(f"4. MP4レンダリング中... (全 {len(frames)} フレーム)")
 
     fig, ax = ox.plot_graph(
         G, show=False, close=False,
-        edge_linewidth=1.0, edge_color='lightgray',
+        edge_linewidth=0.5, edge_color='#e0e0e0',
         node_size=0, bgcolor='white', figsize=(12, 10))
 
+    n_entries = len(entry_nodes)
     ax.set_title(
-        'Step 3.5 v3: 逐次シミュレーション（段階的投入 + 貯留容量ベース分裂）\n'
-        f'総ユーザー: {total_users}人 | 投入レート: {injection_rate}人/step',
+        f'逐次シミュレーション v4（境界流入 + 渋滞ヒートマップ）\n'
+        f'総ユーザー: {total_users}人 | {n_entries}箇所から流入',
         fontsize=13)
 
-    # スタート・ゴールマーカー
-    sx, sy = get_node_xy(G, start_node)
-    ex, ey = get_node_xy(G, end_node)
-    ax.scatter([sx], [sy], c='green', s=200, zorder=6,
-               marker='o', label='START')
-    ax.scatter([ex], [ey], c='purple', s=400, zorder=6,
-               marker='*', label='GOAL')
+    # === 渋滞ヒートマップ用のエッジLineCollection ===
+    segments, edge_keys = build_edge_collection(G)
+    # 初期状態: 全エッジ透明
+    initial_colors = [(0, 0, 0, 0)] * len(segments)
+    congestion_lc = LineCollection(
+        segments, colors=initial_colors, linewidths=4, alpha=0.7, zorder=2)
+    ax.add_collection(congestion_lc)
 
-    # === 凡例パネル（右側に配置） ===
-    # ドットサイズの凡例
-    legend_elements = [
-        plt.scatter([], [], s=dot_size(1), c='gray', edgecolors='black',
-                    linewidths=0.5, label='1人'),
-        plt.scatter([], [], s=dot_size(10), c='gray', edgecolors='black',
-                    linewidths=0.5, label='10人'),
-        plt.scatter([], [], s=dot_size(50), c='gray', edgecolors='black',
-                    linewidths=0.5, label='50人'),
-        plt.scatter([], [], s=dot_size(100), c='gray', edgecolors='black',
-                    linewidths=0.5, label='100人'),
-    ]
-    # 色の凡例
-    color_legend = [
-        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='darkviolet',
-                    markersize=8, label='新規投入'),
-        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='crimson',
-                    markersize=8, label='直進組'),
-        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='dodgerblue',
-                    markersize=8, label='迂回組'),
-        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='green',
-                    markersize=10, label='START'),
-        plt.Line2D([0], [0], marker='*', color='w', markerfacecolor='purple',
-                    markersize=12, label='GOAL'),
-    ]
+    # 渋滞カラーマップ: 緑（空き）→黄→赤（混雑）
+    cmap_congestion = plt.cm.RdYlGn_r
 
-    leg1 = ax.legend(handles=legend_elements, title='ドットサイズ',
-                     loc='upper right', fontsize=9, title_fontsize=10,
-                     facecolor='white', framealpha=0.9)
-    ax.add_artist(leg1)
-    ax.legend(handles=color_legend, title='色の意味',
-              loc='lower right', fontsize=9, title_fontsize=10,
-              facecolor='white', framealpha=0.9)
+    # === 流入地点マーカー（マップ外縁に配置） ===
+    for i, en in enumerate(entry_nodes):
+        ex, ey = get_node_xy(G, en)
+        # 三角マーカーを少し外側にオフセットして表示
+        nodes_gdf = ox.graph_to_gdfs(G, edges=False)
+        minx, miny, maxx, maxy = nodes_gdf.total_bounds
+        cx_map = (minx + maxx) / 2
+        cy_map = (miny + maxy) / 2
+        dx = ex - cx_map
+        dy = ey - cy_map
+        dist = np.sqrt(dx**2 + dy**2)
+        if dist > 0:
+            offset = 50  # 50m外側にオフセット
+            ox_offset = ex + dx / dist * offset
+            oy_offset = ey + dy / dist * offset
+        else:
+            ox_offset, oy_offset = ex, ey
+
+        ax.annotate(
+            f'IN {i+1}', xy=(ex, ey), xytext=(ox_offset, oy_offset),
+            fontsize=8, fontweight='bold', color='darkgreen',
+            ha='center', va='center',
+            arrowprops=dict(arrowstyle='->', color='darkgreen', lw=1.5),
+            bbox=dict(boxstyle='round,pad=0.2', facecolor='lightgreen',
+                      alpha=0.8, edgecolor='darkgreen'),
+            zorder=7)
+
+    # 目的地マーカー
+    dx_d, dy_d = get_node_xy(G, dest_node)
+    ax.scatter([dx_d], [dy_d], c='purple', s=400, zorder=8,
+               marker='*', edgecolors='white', linewidths=1.5)
+    ax.annotate(
+        'GOAL', xy=(dx_d, dy_d), xytext=(dx_d, dy_d + 80),
+        fontsize=10, fontweight='bold', color='purple',
+        ha='center', va='bottom',
+        arrowprops=dict(arrowstyle='->', color='purple', lw=1.5),
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='#e8d5f5',
+                  alpha=0.9, edgecolor='purple'),
+        zorder=9)
+
+    # 渋滞度のカラーバー
+    sm = plt.cm.ScalarMappable(cmap=cmap_congestion,
+                                norm=mcolors.Normalize(vmin=0, vmax=1))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, shrink=0.6)
+    cbar.set_label('渋滞度 (Volume / 貯留容量)', fontsize=10)
+    cbar.set_ticks([0, 0.5, 1.0])
+    cbar.set_ticklabels(['空き', '混雑', '飽和'])
 
     text_outline = [pe.withStroke(linewidth=3, foreground='black')]
-
     scatter = ax.scatter([], [], zorder=10)
     texts = []
     info_text = ax.text(
@@ -506,17 +573,33 @@ def render_mp4(G, frames, start_node, end_node, output_path,
 
     def update(frame_idx):
         nonlocal texts
-
         for t in texts:
             t.remove()
         texts = []
 
         frame_data = frames[frame_idx]
+        vol_snap = volume_frames[frame_idx]
 
+        # === 渋滞ヒートマップ更新 ===
+        edge_colors = []
+        edge_widths = []
+        for u, v in edge_keys:
+            ratio = vol_snap.get((u, v), 0.0)
+            if ratio < 0.01:
+                edge_colors.append((0, 0, 0, 0))  # 透明
+                edge_widths.append(0)
+            else:
+                r = min(ratio, 1.0)
+                edge_colors.append(cmap_congestion(r))
+                edge_widths.append(2 + r * 6)  # 混雑度に応じて太く
+        congestion_lc.set_colors(edge_colors)
+        congestion_lc.set_linewidths(edge_widths)
+
+        # === パケット描画 ===
         if not frame_data:
             scatter.set_offsets(np.empty((0, 2)))
             info_text.set_text(f"Frame {frame_idx}/{len(frames)}")
-            return [scatter, info_text]
+            return [scatter, info_text, congestion_lc]
 
         xs = [d['x'] for d in frame_data]
         ys = [d['y'] for d in frame_data]
@@ -530,10 +613,10 @@ def render_mp4(G, frames, start_node, end_node, output_path,
         scatter.set_edgecolors('black')
         scatter.set_linewidths(0.8)
 
-        # パケット数が少ないときだけ人数ラベルを表示
+        # パケット数が少ないときだけラベル表示
         if len(frame_data) <= 15:
             for d in frame_data:
-                if d['size'] >= 5:  # 5人以上のパケットだけラベル表示
+                if d['size'] >= 5:
                     t = ax.text(
                         d['x'], d['y'], d['label'],
                         color='white', fontsize=8,
@@ -543,22 +626,64 @@ def render_mp4(G, frames, start_node, end_node, output_path,
 
         n_packets = len(frame_data)
         total_people = sum(d['size'] for d in frame_data)
-        arrived = sum(1 for d in frame_data
-                      if d['size'] == 0)  # 到着済みはフレームから消える
         info_text.set_text(
-            f"パケット数: {n_packets} | "
-            f"総人数: {total_people} | "
+            f"パケット数: {n_packets} | 総人数: {total_people} | "
             f"Frame: {frame_idx}/{len(frames)}")
 
-        return [scatter, info_text] + texts
+        return [scatter, info_text, congestion_lc] + texts
 
     ani = animation.FuncAnimation(
         fig, update, frames=len(frames), interval=33, blit=False)
-
     writer = animation.FFMpegWriter(
         fps=30, metadata=dict(artist='Demand Model v2'), bitrate=2500)
     ani.save(output_path, writer=writer)
+    print(f"  => Saved → {output_path}")
+    plt.close(fig)
 
+
+# ============================================================
+# 6. 迂回選択数グラフ
+# ============================================================
+def plot_split_counts(split_counts, output_path, frames_per_step=12,
+                      initial_frames=15):
+    """ステップごとの迂回選択（分裂）回数をプロットする（x軸はフレーム数）"""
+    print(f"5. 迂回選択数グラフ生成中...")
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    # ステップ → フレームに変換（冒頭の静止フレーム分をオフセット）
+    frame_positions = [initial_frames + s * frames_per_step
+                       for s in range(len(split_counts))]
+    bar_width = frames_per_step * 0.8
+
+    ax.bar(frame_positions, split_counts, width=bar_width,
+           color='dodgerblue', alpha=0.7,
+           edgecolor='navy', linewidth=0.5, label='分裂回数/ステップ')
+
+    # 移動平均線
+    if len(split_counts) > 5:
+        window = 5
+        ma = np.convolve(split_counts, np.ones(window)/window, mode='valid')
+        ma_frames = [initial_frames + s * frames_per_step
+                     for s in range(window - 1, len(split_counts))]
+        ax.plot(ma_frames, ma, color='crimson', linewidth=2.5,
+                label=f'移動平均（{window}ステップ）', zorder=5)
+
+    ax.set_xlabel('フレーム数（30fps）', fontsize=13)
+    ax.set_ylabel('迂回選択数（分裂回数）', fontsize=13)
+    ax.set_title('各フレームにおける迂回選択パケット数の推移', fontsize=15)
+    ax.legend(fontsize=11, loc='upper right')
+    ax.grid(axis='y', alpha=0.3)
+
+    # 投入フェーズを背景色で表示
+    inject_end_frame = initial_frames + 15 * frames_per_step
+    ax.axvspan(0, min(inject_end_frame, max(frame_positions)),
+               alpha=0.08, color='green')
+    ax.text(initial_frames + 10, max(split_counts) * 0.95 if split_counts else 1,
+            '← 投入中', fontsize=9, color='green', fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"  => Saved → {output_path}")
     plt.close(fig)
 
@@ -567,19 +692,21 @@ def render_mp4(G, frames, start_node, end_node, output_path,
 # メイン
 # ============================================================
 def main():
-    G, start_node, end_node = setup_graph()
+    G, entry_nodes, dest_node = setup_graph(n_entry_points=6)
 
-    # v3: 100人/ステップ × 15ステップ = 1500人を段階的に投入
-    history = run_simulation(
-        G, start_node, end_node,
-        total_users=1500, injection_rate=100)
+    history, volume_history, split_counts = run_simulation(
+        G, entry_nodes, dest_node,
+        total_users=1500, injection_rate=120)
 
     print("3. アニメーションフレーム生成中...")
-    frames = build_animation_frames(G, history)
+    frames, volume_frames = build_animation_frames(G, history, volume_history)
 
-    output_path = '/Users/pontarousu/Q1zemi/demand_model_v2/dynamic_equilibrium_split.mp4'
-    render_mp4(G, frames, start_node, end_node, output_path,
-               total_users=1500, injection_rate=100)
+    mp4_path = '/Users/pontarousu/Q1zemi/demand_model_v2/dynamic_equilibrium_split.mp4'
+    render_mp4(G, frames, volume_frames, entry_nodes, dest_node, mp4_path,
+               total_users=1500, injection_rate=120)
+
+    graph_path = '/Users/pontarousu/Q1zemi/demand_model_v2/split_counts_graph.png'
+    plot_split_counts(split_counts, graph_path)
 
 
 if __name__ == '__main__':
